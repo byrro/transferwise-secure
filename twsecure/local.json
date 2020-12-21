@@ -1,0 +1,12 @@
+{
+    "MonitorFunction": {
+        "SECRET_ARN": "***************",
+        "TRANSACTIONS_TABLE_NAME": "transferwise-transactions-monitor",
+        "TIME_DELTA_UNIT": "hours",
+        "TIME_DELTA_VALUE": "24"
+    },
+    "NotifierFunction": {
+        "SECRET_ARN": "**************",
+        "SEND_SMS_TO_PHONE_NUMBER": "*************"
+    }
+}
