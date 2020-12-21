@@ -3,7 +3,7 @@
 
 Track debit transactions in your Transferwise account and receive SMS alerts for early fraud-detection and financial loss mitigation.
 
-[![Test Framework](https://img.shields.io/badge/testing-pytest-lightgrey)](https://github.com/pytest-dev/pytest/)
+[![Test Framework](https://img.shields.io/badge/testing-pytest-green)](https://github.com/pytest-dev/pytest/)
 ![Test Coverage](https://raw.githubusercontent.com/byrro/transferwise-secure/main/coverage.svg)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Code Style](https://img.shields.io/badge/code%20style-PEP8-lightgrey)](https://github.com/hhatto/autopep8/)
