@@ -1,0 +1,294 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Secure Transferwise account monitoring with SMS and email
+
+Globals:
+  Function:
+    Timeout: 120
+
+
+Parameters:
+  TransferwiseApiToken:
+    Type: "String"
+    Description: "Transferwise API token secret"
+  SendSmstoPhoneNumber:
+    Type: "String"
+    Description: "To which phone numbers Twilio should send transaction alert SMS messages"
+  TwillioPhoneNumber:
+    Type: "String"
+    Description: "Twillio phone number (used as 'sent from' in SMS messages)"
+  TwillioAccountId:
+    Type: "String"
+    Description: "Twillio account id"
+  TwillioApiToken:
+    Type: "String"
+    Description: "Twillio API token secret"
+  TimeDeltaUnit:
+    Type: "String"
+    Default: "hours"
+    Description: "Unit in 'minutes', 'hours', 'days', etc for how far back in time the monitor should look for Transferwise transaction statements"
+  TimeDeltaValue:
+    Type: "String"
+    Default: "24"
+    Description: "Number of 'minutes', 'hours', 'days', etc for how far back in time the monitor should look for Transferwise transaction statements"
+
+
+Resources:
+  # MONITOR LAMBDA FUNCTION
+  # Reads the latest TW transactions and is triggered periodically by a
+  # CloudWatch Rule (Resources.Scheduler)
+  MonitorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: fn_monitor/
+      Handler: monitor.handler
+      Runtime: python3.8
+      MemorySize: 512
+      Role: !GetAtt MonitorFunctionRole.Arn
+      Environment:
+        Variables:
+          LOGGER_NAME: "MONITOR_LOGGER"
+          SECRET_ARN: !Ref TransferwiseSecrets
+          MAX_NEW_TRANSACTIONS_PER_EXECUTION: 10
+          TRANSACTIONS_TABLE_NAME: !Ref TransactionTable
+          DYNAMODB_TTL_IN_DAYS: 7
+
+          # Simple DynamoDB library env vars:
+          DYNAMODB_BATCH_GET_MAX_SIZE: 100
+          DYNAMODB_BATCH_GET_MAX_RETRIES: 3
+          DYNAMODB_BATCH_WRITE_MAX_SIZE: 25
+          DYNAMODB_BATCH_WRITE_MAX_RETRIES: 3
+
+          # Time delta interval env vars:
+          TIME_DELTA_UNIT: !Ref TimeDeltaUnit
+          TIME_DELTA_VALUE: !Ref TimeDeltaValue
+      Layers:
+        - !Ref DynamoDBLayer
+
+  MonitorFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    DependsOn: [ MonitorFunction ]
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${MonitorFunction}
+      RetentionInDays: 7
+
+
+  # NOTIFIER LAMBDA FUNCTION
+  # Sends SMS/email notifications of new transactions identified in the
+  # Transferwise account; triggered by DDB streams (Resources.TransactionTable)
+  NotifierFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: fn_notifier/
+      Handler: notifier.handler
+      Runtime: python3.8
+      MemorySize: 1700
+      Role: !GetAtt NotifierFunctionRole.Arn
+      Environment:
+        Variables:
+          LOGGER_NAME: "NOTIFIER_LOGGER"
+          SECRET_ARN: !Ref TwillioSecrets
+          TRANSACTIONS_TABLE_NAME: !Ref TransactionTable
+          SEND_SMS_TO_PHONE_NUMBER: !Ref SendSmstoPhoneNumber
+
+
+  NotifierFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    DependsOn: [ NotifierFunction ]
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${NotifierFunction}
+      RetentionInDays: 7
+
+
+  # DYNAMODB HELPERS LAYER
+  # A Lambda layer with helper functions to simplify DynamoDB batch queries
+  DynamoDBLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      Description: "Helper routines to simplify DynamoDB batch queries"
+      CompatibleRuntimes:
+        - python3.8
+        - python3.7
+        - python3.6
+      ContentUri: layer_dynamodb/
+      RetentionPolicy: Delete
+
+
+  # SCHEDULER CLOUDWATCH RULE
+  # Triggers Monitor Function (Resources.MonitorFunction) periodically to read
+  # Transferwise transactions
+  Scheduler:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "Monitor Transferwise account regularly"
+      ScheduleExpression: "rate(3 minutes)"
+      State: "ENABLED"
+      Targets:
+        - Id: "TransferwiseMonitorMonitorFunction"
+          Arn: !GetAtt MonitorFunction.Arn
+
+  SchedulerPermissions:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt MonitorFunction.Arn
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt Scheduler.Arn
+
+
+  # TRANSACTIONS DYNAMODB TABLE
+  # Stores Transferwise transactions and generates streams to the Notifier
+  # Function (Resources.NotifierFunction)
+  TransactionTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: "transferwise-transactions-monitor"
+      BillingMode: "PAY_PER_REQUEST"
+      AttributeDefinitions:
+        - AttributeName: "transaction-hash"
+          AttributeType: "S"
+      KeySchema:
+        - AttributeName: "transaction-hash"
+          KeyType: "HASH"
+      TimeToLiveSpecification:
+        AttributeName: "ttl"
+        Enabled: true
+      StreamSpecification:
+        StreamViewType: NEW_IMAGE
+
+  TransactionTableStreamSource:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 100
+      Enabled: true
+      EventSourceArn: !GetAtt TransactionTable.StreamArn
+      FunctionName: !GetAtt NotifierFunction.Arn
+      MaximumBatchingWindowInSeconds: 20
+      MaximumRecordAgeInSeconds: 3600
+      MaximumRetryAttempts: 3
+      ParallelizationFactor: 1
+      StartingPosition: "LATEST"
+
+
+  # AWS LAMBDA ROLES AND POLICIES
+  # Role assumed by the Monitor and Notifier functions providing all necessary
+  # permissions
+  MonitorFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        # Basic Lambda Role to put logs in CloudWatch Log Group
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        # Custom policy with necessary permissions for the Lambda function
+        - !Ref MonitorLambdaPolicy
+
+  MonitorLambdaPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          # Provide access to DynamoDB Table items and streams
+          - Effect: Allow
+            Action:
+              - dynamodb:BatchGetItem
+              - dynamodb:BatchWriteItem
+              - dynamodb:Query
+            Resource: !GetAtt TransactionTable.Arn
+          # Permission to access Transferwise secrets
+          - Effect: Allow
+            Action:
+              - secretsmanager:GetSecretValue
+            Resource: !Ref TransferwiseSecrets
+
+  NotifierFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      # Basic Lambda Role to put logs in CloudWatch Log Group
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !Ref NotifierLambdaPolicy
+      Policies:
+        - PolicyName: TransferwiseNotifierLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # DynamoDB stream permissions must be declared inline to avoid
+              # circular dependency issues within the stack
+              - Effect: Allow
+                Action:
+                  - dynamodb:DescribeStream
+                  - dynamodb:GetRecords
+                  - dynamodb:GetShardIterator
+                  - dynamodb:ListStreams
+                Resource: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TransactionTable}/stream/*"
+
+  NotifierLambdaPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          # Permission to access Twillio secrets
+          - Effect: Allow
+            Action:
+              - secretsmanager:GetSecretValue
+            Resource: !Ref TwillioSecrets
+
+
+  # TRANSFERWISE AND TWILLIO SECRETS
+  TransferwiseSecrets:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: Transferwise secrets
+      SecretString: !Sub '
+        {
+          "api_token": "${TransferwiseApiToken}"
+        }'
+
+  TwillioSecrets:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: Twillio secrets
+      SecretString: !Sub '
+        {
+          "phone_number": "${TwillioPhoneNumber}",
+          "account_id": "${TwillioAccountId}",
+          "api_token": "${TwillioApiToken}"
+        }'
+
+
+Outputs:
+  MonitorFunctionARN:
+    Description: "Transferwise Monitor Function ARN"
+    Value: !GetAtt MonitorFunction.Arn
+
+  NotifierFunctionARN:
+    Description: "Transferwise Notifier Function ARN"
+    Value: !GetAtt NotifierFunction.Arn
+
+  TransactionTableARN:
+    Description: "Transferwise Transactions DynamoDB Table ARN"
+    Value: !GetAtt TransactionTable.Arn
+
+  TransferwiseSecretARN:
+    Description: "Transferwise Secrets ARN"
+    Value: !Ref TransferwiseSecrets
+  
+  TwillioSecretARN:
+    Description: "Twillio Secrets ARN"
+    Value: !Ref TwillioSecrets
