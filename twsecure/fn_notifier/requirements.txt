@@ -1,0 +1,4 @@
+boto3>=1.16.30
+requests>=2.25.0
+twilio>=6.45.4
+get-aws-secret>=0.2.0b3
